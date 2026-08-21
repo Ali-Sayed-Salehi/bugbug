@@ -1554,6 +1554,39 @@ tasks:
         owner: bugbug-team@mozilla.com
         source: ${repository}/raw/master/data-pipeline.yml
 
+    - ID: publish-perfregressionpredictor
+      created: { $fromNow: "" }
+      deadline: { $fromNow: "3 days" }
+      expires: { $fromNow: "1 year" }
+      provisionerId: proj-bugbug
+      workerType: compute-small
+      payload:
+        maxRunTime: 3600
+        image: mozilla/bugbug-base:${version}
+        command:
+          - bugbug-publish-perf-regression-predictor
+          - --url=https://storage.googleapis.com/models-dump-public/perf-regression-predictor-v1.tar.zst
+
+        artifacts:
+          public/perfregressionpredictormodel.tar.zst:
+            path: /perfregressionpredictormodel.tar.zst
+            type: file
+          public/metrics.json:
+            path: /metrics.json
+            type: file
+
+      routes:
+        - notify.email.bugbug-team@mozilla.com.on-failed
+        - index.project.bugbug.train_perfregressionpredictor.${version}
+        - index.project.bugbug.train_perfregressionpredictor.per_version.${version}.${year}.${month}.${day}.${hour}.${minute}.${second}
+        - index.project.bugbug.train_perfregressionpredictor.per_date.${year}.${month}.${day}.${hour}.${minute}.${second}.${version}
+        - index.project.bugbug.train_perfregressionpredictor.latest
+      metadata:
+        name: bugbug publish perfregressionpredictor model
+        description: Publish the externally-trained Perf Regression Predictor checkpoint as a bugbug model artifact
+        owner: bugbug-team@mozilla.com
+        source: ${repository}/raw/master/data-pipeline.yml
+
     - ID: docker-build
       created: { $fromNow: "" }
       deadline: { $fromNow: "3 days" }
@@ -1576,6 +1609,7 @@ tasks:
         - train-worksforme
         - train-fenixcomponent
         - train-invalidcompatibilityreport
+        - publish-perfregressionpredictor
       payload:
         capabilities:
           privileged: true
