@@ -7,29 +7,36 @@ databases like the rest of the bugbug data pipeline.
 
 Everything is produced by the `bugbug-data-perf-alerts` command, defined in
 `scripts/perf_alerts_retriever.py`, with the logic in the `bugbug.perf`
-package.
+package. One more command, `bugbug-data-perf-commit-risk` in
+`scripts/perf_commit_risk_scorer.py`, scores every commit of the pushes
+snapshot with the perf regression predictor, so evaluations of scheduling
+strategies that depend on risk scores never have to call the prediction
+endpoint.
 
 ## Code layout
 
-| Module                               | Role                                                                  |
-| ------------------------------------ | --------------------------------------------------------------------- |
-| `bugbug/redash.py`                   | generic client for ad-hoc SQL on STMO, reusable outside this pipeline |
-| `bugbug/perf/__init__.py`            | public API and dataset registration; `from bugbug import perf`        |
-| `bugbug/perf/label_policy.py`        | every hand-maintained table that decides labels, and `POLICY_VERSION` |
-| `bugbug/perf/task_labels.py`         | pure functions: label parsing, grouping hierarchy, exclusions         |
-| `bugbug/perf/extraction.py`          | query builders and fetch/parse for Treeherder, `fxci` and Bugzilla    |
-| `bugbug/perf/sql/`                   | the SQL templates                                                     |
-| `bugbug/perf/datasets.py`            | dataset paths, registrations, readers and the archive loader          |
-| `bugbug/perf/regression_labeling.py` | `PushIndex`, culprit pinning, labeled regression records              |
-| `bugbug/perf/push_status.py`         | per-push label state and settled flag; the shared source of negatives |
-| `bugbug/perf/selection_pairs.py`     | test selection pairs and the labeled pair stream                      |
-| `bugbug/perf/regression_commits.py`  | commit-level dataset for the regression predictor                     |
-| `bugbug/perf/task_costs.py`          | joining pushes to task costs                                          |
+| Module                               | Role                                                                                                                |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `bugbug/redash.py`                   | generic client for ad-hoc SQL on STMO, reusable outside this pipeline                                               |
+| `bugbug/perf/__init__.py`            | public API and dataset registration; `from bugbug import perf`                                                      |
+| `bugbug/perf/label_policy.py`        | every hand-maintained table that decides labels, and `POLICY_VERSION`                                               |
+| `bugbug/perf/task_labels.py`         | pure functions: label parsing, grouping hierarchy, exclusions                                                       |
+| `bugbug/perf/extraction.py`          | query builders and fetch/parse for Treeherder, `fxci` and Bugzilla                                                  |
+| `bugbug/perf/sql/`                   | the SQL templates                                                                                                   |
+| `bugbug/perf/datasets.py`            | dataset paths, registrations, readers and the archive loader                                                        |
+| `bugbug/perf/regression_labeling.py` | `PushIndex`, culprit pinning, labeled regression records                                                            |
+| `bugbug/perf/push_status.py`         | per-push label state and settled flag; the shared source of negatives                                               |
+| `bugbug/perf/selection_pairs.py`     | test selection pairs and the labeled pair stream                                                                    |
+| `bugbug/perf/regression_commits.py`  | commit-level dataset for the regression predictor                                                                   |
+| `bugbug/perf/task_costs.py`          | joining pushes to task costs                                                                                        |
+| `bugbug/perf/commit_risk.py`         | the predictor's ignore rules and per-patch scoring, shared with the HTTP service, and the batch scorer over a clone |
 
 Dependencies point one way: `label_policy` imports nothing from the package,
 `task_labels` reads its tables, `extraction` and `regression_labeling` build on
 both, `push_status` builds on `regression_labeling`, and `selection_pairs` and
 `regression_commits` both take their negatives from `push_status`.
+`commit_risk` reads pushes through `regression_labeling` and the clone through
+`bugbug.repository`; the HTTP service imports it, never the reverse.
 
 ## Sources
 
@@ -38,7 +45,9 @@ both, `push_status` builds on `regression_labeling`, and `selection_pairs` and
 | Treeherder Postgres replica         | STMO (Redash) data source 89, SQL | Perfherder alerts, summaries and their statuses, signatures, pushes, commits, performance jobs                                                                            |
 | BigQuery `fxci` dataset             | STMO (Redash) data source 63, SQL | Worker pool, runs, machine time and attributed cloud cost of every performance task                                                                                       |
 | Bugzilla                            | REST API, optional token          | The regression bug of each summary and the canonical bugs its duplicates point at, with `regressed_by` to pin the culprit commit and the resolution to decide the outcome |
-| Mercurial clone (`mozilla-central`) | `hg export`                       | Commit messages and diffs for the regression predictor dataset                                                                                                            |
+| Mercurial clone (`mozilla-central`) | `hg export`                       | Commit messages and diffs for the regression predictor dataset, and the commits scored by the commit risk scorer                                                          |
+| hg.mozilla.org pushlog              | `json-pushes` JSON API            | The pushlog id of each push, which Treeherder does not store and the taskgraph's push-count rules are defined on                                                          |
+| Perf regression predictor           | published checkpoint              | The risk score of every commit, computed by the commit risk scorer                                                                                                        |
 
 The pipeline only handles autoland (`REPOSITORY` in `label_policy.py`).
 Sheriffs attribute regressions to autoland pushes, and a mozilla-central push
@@ -102,7 +111,10 @@ Their format changes by these rules, also written above their registrations:
   after the culprit push; those lead pushes can be culprits but are never
   negatives, because their own alerts predate the snapshot.
   the most recent `--reretrieve-days` are refreshed on every run because jobs
-  keep completing.
+  keep completing. Every push without a `pushlog_id`, archived ones included,
+  then gets it from the hg.mozilla.org pushlog, queried by push date and
+  joined on the head changeset; pushes the pushlog does not list keep `null`
+  and are looked up again on the next run.
 - `data/perf_alert_bugs.json`: the regression bugs referenced by summaries,
   plus the canonical bugs reached by following `dupe_of` up to three hops.
 - `data/perf_task_costs.json`: one row per performance task from `fxci`,
@@ -153,6 +165,31 @@ time based `split`. Negatives are sampled at `--negative-ratio` times the number
 positives from the clean settled commits in `perf_push_status.json`, the same
 rule the selection pairs use, never a commit that is a culprit elsewhere.
 Commits whose diff is empty, such as merges, are skipped.
+
+`bugbug-data-perf-commit-risk` scores every commit of every push in
+`perf_pushes.json` with the perf regression predictor and writes
+`data/perf_commit_risk.json`: one record per commit and model version with
+the commit's `risk_score`, or the `ignored_reason` the predictor skips it for
+(backouts, merges, wptsync imports, `ignore-this-changeset`). It applies
+exactly the rules and scoring of the `perfregressionpredictor` endpoint,
+which it shares through `bugbug/perf/commit_risk.py`, with the commit
+metadata and patches read from the clone instead of hg.mozilla.org. A commit
+counts as a backout when hg.mozilla.org (or `mozext` on the clone) resolved
+the changesets it backs out, or when its message announces a backout or
+revert with a changeset hash. The second test matters for Lando's git-style
+reverts (`This reverts commit <hash>`): hg.mozilla.org resolves the reverted
+changeset among the last 100 ancestors only, so without it the endpoint
+scored about a quarter of backouts as ordinary changes. Checked on 738
+autoland commits of October 2026, the clone with `mozext` and the message
+parser agree on every ignore reason. The dataset is an archive: a run scores only the commits that have no record for
+the current model version, so a run stopped by its `--time-budget` is resumed
+by the next one and a new model version rescores the history while the old
+scores stay. Commits the clone does not have yet are skipped and counted, and
+`--until` defaults to two days ago so that autoland commits have reached
+mozilla-central. The model version is the checkpoint's own when its
+`bugbug_model.json` declares one, otherwise the name of the published
+artifact, such as `perf-regression-predictor-v1`; `--model-version`
+overrides it for a local checkpoint.
 
 Flag defaults are the `DEFAULT_*` constants at the top of
 `scripts/perf_alerts_retriever.py`; the pipeline tasks pass no flags, so those
@@ -224,16 +261,17 @@ so edits to those tables reach archived alerts too.
 
 ### `perf_pushes.json` (one record per push)
 
-| Field                | Type | Meaning                                                                                                       |
-| -------------------- | ---- | ------------------------------------------------------------------------------------------------------------- |
-| `push_id`            | int  | Treeherder push id                                                                                            |
-| `repository`         | str  | always `autoland`                                                                                             |
-| `revision`           | str  | head changeset hash                                                                                           |
-| `time`               | ts   | when the push landed                                                                                          |
-| `author`             | str? | who pushed                                                                                                    |
-| `commits[]`          | list | in push order: `revision`, `desc` (first line), `bug_id` (int?, parsed from the first line), `backout` (bool) |
-| `perf_jobs[]`        | list | one entry per perf task label that ran: `label`, `tier` (int?), `duration` (total seconds), `runs[]`          |
-| `perf_jobs[].runs[]` | list | one entry per run: `task_id` (str?), `retry_id` (int?), `result` (str), `duration` (int?)                     |
+| Field                | Type | Meaning                                                                                                               |
+| -------------------- | ---- | --------------------------------------------------------------------------------------------------------------------- |
+| `push_id`            | int  | Treeherder push id                                                                                                    |
+| `pushlog_id`         | int? | hg.mozilla.org pushlog id; `null` until the pushlog lists the push, and absent from rows archived before it was added |
+| `repository`         | str  | always `autoland`                                                                                                     |
+| `revision`           | str  | head changeset hash                                                                                                   |
+| `time`               | ts   | when the push landed                                                                                                  |
+| `author`             | str? | who pushed                                                                                                            |
+| `commits[]`          | list | in push order: `revision`, `desc` (first line), `bug_id` (int?, parsed from the first line), `backout` (bool)         |
+| `perf_jobs[]`        | list | one entry per perf task label that ran: `label`, `tier` (int?), `duration` (total seconds), `runs[]`                  |
+| `perf_jobs[].runs[]` | list | one entry per run: `task_id` (str?), `retry_id` (int?), `result` (str), `duration` (int?)                             |
 
 ### `perf_alert_bugs.json` (one record per bug linked from a summary)
 
@@ -368,6 +406,18 @@ are aggregated to the push by taking the maximum per test.
 | `commit_message`                        | str            | full message from `hg export`, header lines removed                                         |
 | `diff`                                  | str            | the git-style diff from `hg export`                                                         |
 | `policy_version`                        | int            | rules version                                                                               |
+
+### `perf_commit_risk.json` (one record per commit and model version)
+
+| Field                                | Type          | Meaning                                                                                      |
+| ------------------------------------ | ------------- | -------------------------------------------------------------------------------------------- |
+| `node`                               | str           | changeset hash                                                                               |
+| `push_id`, `pushlog_id`, `push_time` | int, int?, ts | the push the commit landed in, as in `perf_pushes.json`                                      |
+| `ignored_reason`                     | str?          | `backout`, `merge`, `wptsync` or `ignore-this-changeset` when the predictor skips the commit |
+| `risk_score`                         | float?        | probability of the positive class, uncalibrated; `null` for ignored commits                  |
+| `prob`, `class`                      | list?, int?   | both class probabilities and the predicted class; `null` for ignored commits                 |
+| `model_version`                      | str           | the checkpoint that produced the record; read one version at a time                          |
+| `scored_at`                          | ts            | when the scorer run that produced the record started                                         |
 
 ## Labeling policy
 
@@ -611,6 +661,21 @@ warning, so pull it first. `--refresh-repo` clones or pulls it for you, but it
 also reverts local changes and strips unpushed commits, so only pass it for a
 clone you keep for this purpose.
 
+The commit risk scorer needs the `perf-regression-predictor` extra for
+PyTorch and Transformers, and downloads the published checkpoint into
+`./perfregressionpredictormodel` unless `--model-dir` points at one:
+
+```sh
+uv run --extra perf-regression-predictor bugbug-data-perf-commit-risk \
+  --repo-dir ~/repos/mozilla-unified --since 2026-09-01 --limit 200
+```
+
+Inference runs on the CPU at roughly one commit per second, so bound a local
+run with `--since`, `--limit` or `--time-budget HOURS`; the next run continues
+where it stopped. A clone without the `mozext` Mercurial extension detects
+backouts from commit messages instead of the pushlog's `backsoutnodes`, with a
+warning.
+
 Each command first tries to download the previous snapshot from the
 Taskcluster index and falls back to the files in `./data/`, logging a warning
 until the pipeline has published once. `retrieve` takes `--skip-alerts`,
@@ -632,7 +697,11 @@ that graph, so running them in production takes no wiring beyond:
 1. Landing the change on master.
 2. A bugbug release, which builds the Docker images for the new version tag
    and deploys them; the deploy fires the hook. The `bugbug-base` image gets
-   the `bugbug-data-perf-alerts` entry point from `pyproject.toml`.
+   the `bugbug-data-perf-alerts` entry point from `pyproject.toml`. The
+   scorer runs in its own `bugbug-perf-commit-risk` image, built from
+   `infra/dockerfile.perf_commit_risk` with the other images in
+   `docker-compose.yml`: the commit-retrieval image plus the
+   `perf-regression-predictor` extra, which no other pipeline image ships.
 3. A `REDASH_API_KEY` entry in the Taskcluster secret
    `project/bugbug/production`, ideally the key of a dedicated STMO user. The
    retrieval task reads it through the Taskcluster proxy.
@@ -655,10 +724,15 @@ the secret), then `perf-regressions-generator` (compute-large), then
 image and keeps its Mercurial clone in the same `bugbug-mercurial-repository`
 cache as `commit-retrieval`. A worker cache stays on the machine that wrote it,
 and the two tasks run on different worker types, so the export passes
-`--refresh-repo` to clone or pull its own copy first. Artifacts are indexed
-under `project.bugbug.data_perf_alerts`,
-`project.bugbug.data_perf_regressions` and
-`project.bugbug.data_perf_regression_commits`. Apart from the export's
-`--repo-dir` and `--refresh-repo`, the tasks pass no flags, so the `DEFAULT_*`
-constants in `scripts/perf_alerts_retriever.py` are the production
-configuration.
+`--refresh-repo` to clone or pull its own copy first. `perf-commit-risk-scorer`
+runs after the retrieval in the `bugbug-perf-commit-risk` image with the same
+clone cache and flags, plus `--time-budget=20` so a run always writes its
+archive within the task's 24 hours; the first run over a year of commits
+takes several runs, later ones score the new pushes in minutes. Artifacts are
+indexed under `project.bugbug.data_perf_alerts`,
+`project.bugbug.data_perf_regressions`,
+`project.bugbug.data_perf_regression_commits` and
+`project.bugbug.data_perf_commit_risk`. Apart from the export's and scorer's
+`--repo-dir`, `--refresh-repo` and the scorer's `--time-budget`, the tasks
+pass no flags, so the `DEFAULT_*` constants in the two scripts are the
+production configuration.

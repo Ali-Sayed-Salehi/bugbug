@@ -161,7 +161,8 @@ class Retriever:
 
         Pushes start ``PUSHES_LEAD_DAYS`` before the alerts so the culprit of
         the earliest alert is present, and stop a day ago so no push is stored
-        while its jobs are still running.
+        while its jobs are still running. Every push without a pushlog id,
+        archived ones included, then gets it from hg.mozilla.org.
         """
         pushes = {}
         if perf.load_previous_snapshot(perf.PERF_PUSHES_DB):
@@ -184,11 +185,36 @@ class Retriever:
         for push in perf.fetch_pushes(client, time_from, time_to, window_days):
             pushes[push["push_id"]] = push
 
+        self.fill_pushlog_ids(pushes.values(), window_days)
+
         db.write(
             perf.PERF_PUSHES_DB,
             (pushes[push_id] for push_id in sorted(pushes)),
         )
         zstd_compress(perf.PERF_PUSHES_DB)
+
+    def fill_pushlog_ids(self, pushes, window_days: int) -> None:
+        """Fetch the pushlog id of every push that lacks one.
+
+        Treeherder pushes carry none, and the taskgraph's push-count rules,
+        such as the backstop's, are defined on it. Pushes the pushlog does not
+        list keep ``None`` and are looked up again on the next run.
+        """
+        missing = [push for push in pushes if push.get("pushlog_id") is None]
+        times = [
+            time
+            for push in missing
+            if (time := parse_timestamp(push["time"])) is not None
+        ]
+        if not times:
+            return
+        pushlog_ids = perf.fetch_pushlog_ids(perf.pushlog_windows(times, window_days))
+        still_missing = perf.set_pushlog_ids(missing, pushlog_ids)
+        logger.info(
+            "Pushlog ids: %d pushes filled, %d not found in the pushlog",
+            len(missing) - still_missing,
+            still_missing,
+        )
 
     def get_settle_cutoff(self, settle_days: int, until: datetime | None) -> datetime:
         """End of the dataset window; ``until`` can only tighten it."""
