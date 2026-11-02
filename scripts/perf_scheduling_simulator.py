@@ -196,10 +196,69 @@ def production(timeline: sim.Timeline, baseline: str) -> sim.Strategy:
     return BASELINES[baseline](expanded_labels=expanded)
 
 
-def resolve_strategy(spec: str, timeline: sim.Timeline, baseline: str) -> sim.Strategy:
+def resolve_strategy(
+    spec: str,
+    timeline: sim.Timeline,
+    baseline: str,
+    selection: dict[str, Any] | None = None,
+) -> sim.Strategy:
+    if spec == "production":
+        return production(timeline, baseline)
+    strategy = sim.parse_strategy(spec)
+    if strategy.family in sim.SELECTION_FAMILIES:
+        if selection is None:
+            raise SystemExit(
+                f"{strategy.family} needs --test-categories and --commit-areas"
+            )
+        strategy.bind(  # type: ignore[attr-defined]
+            selection["selector"],
+            timeline,
+            make_cadence(strategy.params["cadence"], timeline, baseline),
+        )
+    return strategy
+
+
+def make_cadence(spec: str, timeline: sim.Timeline, baseline: str) -> sim.Strategy:
+    """The batching rule a selection strategy follows: production's or any spec."""
     if spec == "production":
         return production(timeline, baseline)
     return sim.parse_strategy(spec)
+
+
+def load_selection(
+    args: argparse.Namespace, timeline: sim.Timeline
+) -> dict[str, Any] | None:
+    """The selector the selection strategies use, from --test-categories and --commit-areas."""
+    if not getattr(args, "test_categories", None) and not getattr(
+        args, "commit_areas", None
+    ):
+        return None
+    if not (args.test_categories and args.commit_areas):
+        raise SystemExit("--test-categories and --commit-areas go together")
+    from bugbug.perf.test_categories import TestCatalog
+
+    with open(args.test_categories, encoding="utf-8") as fh:
+        catalog = TestCatalog(json.loads(line) for line in fh if line.strip())
+    with open(args.commit_areas, encoding="utf-8") as fh:
+        commit_info = {
+            record["node"]: record
+            for record in (json.loads(line) for line in fh if line.strip())
+        }
+    selector = sim.build_selector(
+        args.selector,
+        timeline,
+        catalog,
+        commit_info,
+        perf.get_perf_regressions(),
+        args.selection_unmapped,
+    )
+    logger.info(
+        "Selector %s: %d tests, %d commits with areas",
+        args.selector,
+        len(catalog.records),
+        len(commit_info),
+    )
+    return {"selector": selector, "kind": args.selector}
 
 
 def _stats(summary: dict[str, Any] | None) -> str:
@@ -299,10 +358,11 @@ def cmd_simulate(args: argparse.Namespace) -> None:
         ci,
     )[0]
     rows: list[tuple[str, dict[str, Any], bool]] = [("production", baseline, True)]
+    selection = load_selection(args, timeline)
     for spec in specs:
         if spec == "production":
             continue
-        strategy = resolve_strategy(spec, timeline, args.baseline)
+        strategy = resolve_strategy(spec, timeline, args.baseline, selection)
         result = sim.run(strategy, timeline, [window], args.bootstrap, ci)[0]
         rows.append((strategy.name, result, sim.is_feasible(result, baseline)))
 
@@ -447,7 +507,17 @@ def cmd_optimize(args: argparse.Namespace) -> None:
         f"{label} | eval {args.cost} | eval {args.statistic} {label} |",
         "|---|---|---|---|---|---|",
     ]
+    selection = load_selection(args, timeline)
     for family in families:
+        fixed: dict[str, Any] = {}
+        if family in sim.SELECTION_FAMILIES:
+            if selection is None:
+                raise SystemExit(f"{family} needs --test-categories and --commit-areas")
+            fixed = {
+                "selector": selection["selector"],
+                "history": timeline,
+                "cadence_strategy": make_cadence("production", timeline, args.baseline),
+            }
         study = sim.optimize_family(
             family,
             timeline,
@@ -460,6 +530,7 @@ def cmd_optimize(args: argparse.Namespace) -> None:
             args.statistic,
             ci,
             args.max_cost_ratio,
+            **fixed,
         )
         points = sim.pareto_points(study)
         rows = sim.evaluate_points(
@@ -472,6 +543,7 @@ def cmd_optimize(args: argparse.Namespace) -> None:
             args.bootstrap,
             args.statistic,
             ci,
+            **fixed,
         )
         picks = sim.matching_points(rows, baseline_objectives)
         pruned = sim.pruned_trials(study)
@@ -771,6 +843,28 @@ def _add_common(parser: argparse.ArgumentParser) -> None:
         "--calibration",
         metavar="MODE",
         help="How the risk strategies see the scores. fit (default): the pipeline's isotonic mapping to culprit rates, fitted on the labeled commits of the optimize window (optimize) or of the history before the window (simulate) and applied to every commit, as the endpoint serves a table fitted on the past. published: the pipeline's perf_risk_calibration.json for the model version. none: the model's raw output. Or a PATH to a JSON lines file of calibration records.",
+    )
+    parser.add_argument(
+        "--test-categories",
+        metavar="PATH",
+        help="perf_test_categories.json: the areas and scenario each perf test declares in the tree. With --commit-areas, enables the selection strategies (selected_batch, label_risk_batch).",
+    )
+    parser.add_argument(
+        "--commit-areas",
+        metavar="PATH",
+        help="perf_commit_areas.json: the Bugzilla components and areas of the files each commit touched.",
+    )
+    parser.add_argument(
+        "--selector",
+        choices=["area", "history", "both"],
+        default="area",
+        help="How the selection strategies pick tests for a commit: the tests declaring an area the commit's components belong to (default), the tests that commits in the same components regressed before, or either.",
+    )
+    parser.add_argument(
+        "--selection-unmapped",
+        choices=["all", "none"],
+        default="all",
+        help="What the area selector picks for a commit whose components belong to no area: every test (default) or none.",
     )
     parser.add_argument(
         "--output", metavar="PATH", help="Write the full results as JSON."

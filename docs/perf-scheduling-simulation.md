@@ -51,16 +51,18 @@ schedulers need to hand decisions from one task to the next: the replay sees
 the whole history in order. A strategy `observe`s every push and `decide`s
 what to run on it: `ALL` for the whole suite, a set of labels, or nothing.
 
-| Family                          | A batch is due when                                                                                                                     |
-| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| `production_recorded`           | the whole suite ran on the push in history, and `expanded_labels` where they ran; sheriff backfills are left out (the default baseline) |
-| `production`                    | 20 pushes or 4 hours since the last backstop, the rule replayed; `expanded_labels` also run on every 10th pushlog id                    |
-| `fixed_interval`                | `push_interval` pushes have been made since the last batch, counted by pushlog id like the backstop                                     |
-| `commit_count`                  | `commits` commits the predictor would score have landed since the last batch: RASB with every score equal                               |
-| `time_since_batch`              | `hours` have passed since the last batch                                                                                                |
-| `rasb`, `rasb_la`               | the risk of the commits since the last batch reaches `threshold`: the probability at least one regressed, or their sum                  |
-| `rapb`, `rapb_la`               | as above with each commit's score aged by `aging_rate` per hour waited                                                                  |
-| `rapb_pushes`, `rapb_la_pushes` | as above, aged by `aging_rate` per push landed after the commit instead of per hour                                                     |
+| Family                          | A batch is due when                                                                                                                                      |
+| ------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `production_recorded`           | the whole suite ran on the push in history, and `expanded_labels` where they ran; sheriff backfills are left out (the default baseline)                  |
+| `production`                    | 20 pushes or 4 hours since the last backstop, the rule replayed; `expanded_labels` also run on every 10th pushlog id                                     |
+| `fixed_interval`                | `push_interval` pushes have been made since the last batch, counted by pushlog id like the backstop                                                      |
+| `commit_count`                  | `commits` commits the predictor would score have landed since the last batch: RASB with every score equal                                                |
+| `time_since_batch`              | `hours` have passed since the last batch                                                                                                                 |
+| `rasb`, `rasb_la`               | the risk of the commits since the last batch reaches `threshold`: the probability at least one regressed, or their sum                                   |
+| `rapb`, `rapb_la`               | as above with each commit's score aged by `aging_rate` per hour waited                                                                                   |
+| `rapb_pushes`, `rapb_la_pushes` | as above, aged by `aging_rate` per push landed after the commit instead of per hour                                                                      |
+| `selected_batch`                | a `cadence` rule's batch is due; the batch runs the labels selected by the pushes since the last batch, and the whole suite every `full_hours`           |
+| `label_risk_batch`              | a `cadence` rule's batch is due; the batch runs the labels that `threshold` commits selected since they last ran, and the whole suite every `full_hours` |
 
 `PRESETS` holds the shadow schedulers' current parameters, keyed by their
 names (`perf_rasb`, ...), and `parse_strategy` reads `family:key=value,...`.
@@ -72,6 +74,49 @@ The baseline's expanded labels, the tier 1 raptor tests that production runs
 on every 10th push besides backstops, are derived from history: the labels
 that ran on at least half of the non-backstop pushes whose pushlog id is a
 multiple of 10.
+
+### Selection strategies
+
+The two selection families (`selection.py`) run only the tests the landed
+commits can regress. A _selector_ names, for each commit, the labels it
+selects out of the suite:
+
+- `area`: every performance test declares the code areas it stresses in the
+  tree (`testing/performance/categories.yml`, read into
+  `perf_test_categories.json` by `bugbug-data-perf-test-categories`), and
+  each area lists the Bugzilla components whose changes are likely to move
+  its tests. `perf_commit_areas.json` (`bugbug-data-perf-commit-areas`) gives
+  each commit the components of the files it touched and so its areas. A
+  commit selects the labels whose tests share an area with it. A commit in
+  a mobile component selects the labels of mobile applications, one in a
+  cross-cutting component (the build system, the test harnesses, the
+  low-level runtime, the remote protocol) selects everything, and one whose
+  components belong to no area selects everything or nothing as
+  `--selection-unmapped` says. Labels whose tests the catalog does not know
+  are always selected.
+- `history`: a commit selects the tests that commits in the same components
+  regressed before, from the regressions dataset. A regression becomes known
+  14 days after its culprit push, the time it takes to be confirmed and
+  pinned, so the replay never selects a test because of the very regression
+  it is about to catch.
+- `both`: either.
+
+`selected_batch` keeps the batches of its `cadence` rule (`production` by
+default, so the batches fall where the backstop's do) and runs in each the
+union of what the pushes since the last batch selected. `label_risk_batch`
+keeps one counter per label, raised by every commit that selects it, and a
+batch runs the labels whose counter reached `threshold`, resetting them, so
+a label few commits can affect runs rarely and one most commits touch runs
+at every batch. Both run the whole suite instead once `full_hours` have
+passed since the last full run, which bounds how long a regression the
+selector misses can wait. `--test-categories` and `--commit-areas` name the
+two datasets and `--selector` picks the selector; the commands below build
+the datasets from a Firefox checkout and a Mercurial clone:
+
+```sh
+bugbug-data-perf-test-categories --firefox-dir ~/repos/firefox
+bugbug-data-perf-commit-areas --repo-dir ~/repos/mozilla-unified
+```
 
 ### DONTBUILD pushes
 

@@ -47,6 +47,16 @@ from bugbug.perf.simulation.optimize import (
     pruned_trials,
     run,
 )
+from bugbug.perf.simulation.selection import (
+    SELECTION_FAMILIES,
+    AreaSelector,
+    HistorySelector,
+    LabelRiskBatch,
+    SelectedBatch,
+    UnionSelector,
+    build_label_tables,
+    build_selector,
+)
 from bugbug.perf.simulation.splits import default_bounds, make_windows
 from bugbug.perf.simulation.strategies import (
     ALL,
@@ -78,8 +88,18 @@ from bugbug.perf.simulation.timeline import (
     load_risks,
 )
 
+FAMILIES.update(SELECTION_FAMILIES)
+
 __all__ = [
     "ALL",
+    "AreaSelector",
+    "HistorySelector",
+    "LabelRiskBatch",
+    "SELECTION_FAMILIES",
+    "SelectedBatch",
+    "UnionSelector",
+    "build_label_tables",
+    "build_selector",
     "CapacityModel",
     "CiResult",
     "CiSettings",

@@ -496,5 +496,8 @@ def parse_strategy(spec: str) -> Strategy:
         try:
             params[key.strip()] = int(value)
         except ValueError:
-            params[key.strip()] = float(value)
+            try:
+                params[key.strip()] = float(value)
+            except ValueError:
+                params[key.strip()] = value.strip()
     return make_strategy(family, params)
